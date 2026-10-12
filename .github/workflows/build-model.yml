@@ -1,0 +1,100 @@
+# Builds the on-device recitation checker's model for the Surah by Surah app.
+#
+# Takes Tarteel's open Quran recitation model (tarteel-ai/whisper-base-ar-quran, Apache-2.0), converts
+# it to whisper.cpp's format, shrinks it (8-bit), tries it on a few real recitations, and publishes it
+# as the release "model-v1". The app downloads it from there once and runs it on the phone.
+#
+# Runs by itself when this file is pushed; to run it again: Actions tab → "Build recitation model" →
+# "Run workflow".
+
+name: Build recitation model
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-model.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TAG: model-v1
+      NAME: ggml-tarteel-base-ar-quran
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install transformers numpy huggingface_hub
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Download Tarteel's model
+        run: |
+          python -c "from huggingface_hub import snapshot_download; snapshot_download('tarteel-ai/whisper-base-ar-quran', local_dir='hf', allow_patterns=['*.json', '*.txt', 'pytorch_model.bin'])"
+          ls -la hf
+
+      - name: Get whisper.cpp and Whisper's audio filters
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp
+          git clone --depth 1 https://github.com/openai/whisper
+
+      - name: Convert to whisper.cpp format
+        run: |
+          mkdir -p out
+          python whisper.cpp/models/convert-h5-to-ggml.py ./hf ./whisper ./out
+          mv out/ggml-model.bin "out/$NAME-f16.bin"
+
+      - name: Build whisper.cpp tools
+        run: |
+          cmake -S whisper.cpp -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j 4 --config Release --target whisper-quantize whisper-cli
+
+      - name: Shrink to 8-bit
+        run: |
+          ./build/bin/whisper-quantize "out/$NAME-f16.bin" "out/$NAME-q8_0.bin" q8_0
+          ls -la out
+
+      - name: Try it on real recitations
+        run: |
+          mkdir -p test
+          echo "| Reciter | Ayah | Heard |" > test/results.md
+          echo "|---|---|---|" >> test/results.md
+          for key in 001002 103002 112001 112004 026004 114005 067001; do
+            for r in Alafasy_128kbps Husary_128kbps Minshawy_Murattal_128kbps; do
+              curl -sfL "https://everyayah.com/data/$r/$key.mp3" -o test/a.mp3 || continue
+              ffmpeg -loglevel error -y -i test/a.mp3 -ar 16000 -ac 1 -c:a pcm_s16le test/a.wav
+              start=$(date +%s.%N)
+              text=$(./build/bin/whisper-cli -m "out/$NAME-q8_0.bin" -l ar -nt -np -t 4 -f test/a.wav 2>/dev/null | tr -s ' \n' ' ')
+              secs=$(python -c "print(round($(date +%s.%N) - $start, 1))")
+              echo "| ${r%%_*} | ${key:0:3}:${key:3} | $text (${secs}s) |" | tee -a test/results.md
+            done
+          done
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -sfL https://www.apache.org/licenses/LICENSE-2.0.txt -o out/LICENSE-model.txt
+          {
+            echo "Quran recitation model for the Surah by Surah app's Test mode."
+            echo
+            echo "Converted from [tarteel-ai/whisper-base-ar-quran](https://huggingface.co/tarteel-ai/whisper-base-ar-quran) (Apache-2.0, by Tarteel) to whisper.cpp's ggml format and quantized to 8-bit (q8_0). No other changes."
+            echo
+            echo "- Size: $(stat -c %s "out/$NAME-q8_0.bin") bytes"
+            echo "- SHA-256: $(sha256sum "out/$NAME-q8_0.bin" | cut -d' ' -f1)"
+            echo
+            echo "## Test transcriptions (this runner's CPU, 4 threads)"
+            echo
+            cat test/results.md
+          } > notes.md
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Recitation model v1" --notes-file notes.md \
+            "out/$NAME-q8_0.bin" out/LICENSE-model.txt
