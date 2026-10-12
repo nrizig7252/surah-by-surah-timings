@@ -48,9 +48,15 @@ jobs:
 
       - name: Convert to whisper.cpp format
         run: |
+          # The converter takes the text length from config.json's "max_length", which in Tarteel's
+          # config is a generation setting (1024), not the model's real limit (448). whisper.cpp then
+          # refuses to load the model, so use the real limit.
+          python -c "import json; p='hf/config.json'; c=json.load(open(p)); c['max_length']=c.get('max_target_positions', 448); json.dump(c, open(p, 'w'), indent=2)"
           mkdir -p out
           python whisper.cpp/models/convert-h5-to-ggml.py ./hf ./whisper ./out
           mv out/ggml-model.bin "out/$NAME-f16.bin"
+          # Check the header: n_text_ctx (the 7th number) must be 448.
+          python -c "import struct,sys; h=struct.unpack('<12i', open('out/$NAME-f16.bin','rb').read(48)); print('header', h); sys.exit(0 if h[6]==448 else 'n_text_ctx is wrong')"
 
       - name: Build whisper.cpp tools
         run: |
@@ -72,11 +78,18 @@ jobs:
               curl -sfL "https://everyayah.com/data/$r/$key.mp3" -o test/a.mp3 || continue
               ffmpeg -loglevel error -y -i test/a.mp3 -ar 16000 -ac 1 -c:a pcm_s16le test/a.wav
               start=$(date +%s.%N)
-              text=$(./build/bin/whisper-cli -m "out/$NAME-q8_0.bin" -l ar -nt -np -t 4 -f test/a.wav 2>/dev/null | tr -s ' \n' ' ')
+              text=$(./build/bin/whisper-cli -m "out/$NAME-q8_0.bin" -l ar -nt -np -t 4 -f test/a.wav 2>test/err.txt | tr -s ' \n' ' ')
+              [ -z "${text// }" ] && text="(nothing: $(grep -iE 'error|fail|wrong' test/err.txt | head -2 | tr '\n|' '  '))"
               secs=$(python -c "print(round($(date +%s.%N) - $start, 1))")
               echo "| ${r%%_*} | ${key:0:3}:${key:3} | $text (${secs}s) |" | tee -a test/results.md
             done
           done
+
+      - name: Stop if the model didn't work
+        run: |
+          if grep -q "(nothing:" test/results.md; then
+            echo "Some test recitations came back empty; not publishing."; exit 1
+          fi
 
       - name: Publish the release
         env:
